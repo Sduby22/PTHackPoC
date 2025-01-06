@@ -2,9 +2,10 @@ package util
 
 import (
 	"crypto/sha1"
-	"encoding/hex"
 	"errors"
+	"fmt"
 	"math/rand"
+	"net/url"
 	"os"
 
 	"github.com/anacrolix/torrent/bencode"
@@ -13,7 +14,7 @@ import (
 // Generate a random peer ID (qBit 4.6.3)
 func RandomPeerId() string {
 	chars := "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_.!~*()"
-	ret := "-qB4630-"
+	ret := "-qB5020-"
 
 	for i := 0; i < 12; i++ {
 		ret += string(chars[rand.Intn(len(chars))])
@@ -64,7 +65,7 @@ func ParseAndRegenerateTorrent(filename string, fakeTracker string) (string, str
 
 	hasher := sha1.New()
 	hasher.Write(infoBytes)
-	infoHash := hex.EncodeToString(hasher.Sum(nil))
+	infoHash := string(hasher.Sum(nil))
 
 	// Calculate total size of files
 	infoMap, ok := infoValue.(map[string]interface{})
@@ -99,6 +100,7 @@ func ParseAndRegenerateTorrent(filename string, fakeTracker string) (string, str
 
 	// Regenerate a new torrent with fake tracker
 	origAnnounce := m["announce"].(string)
+	fakeTracker = fmt.Sprintf("http://127.0.0.1:1088/announce?orig_tracker=%s&total_size=%d", url.QueryEscape(origAnnounce), totalSize)
 	m["announce"] = fakeTracker
 	newTorrent, err := bencode.Marshal(m)
 	if err != nil {

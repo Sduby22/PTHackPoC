@@ -2,33 +2,92 @@ package main
 
 import (
 	"compress/gzip"
-	"encoding/hex"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/lyc8503/ptcheat/util"
 )
 
-var port int
+var FAKE_SPEED = 512 * 1024 // 512KB/s
+var port int = 17673
+var peerId string = util.RandomPeerId()
+var key string = util.RandomKey()
 
-func requestTracker(trackerUrl string, infoHashHex string, initSize int64) {
-	infoHash, err := hex.DecodeString(infoHashHex)
-	if err != nil {
-		fmt.Println("Error:", err)
+type InfoHash struct {
+	InfoHash        string
+	InfoHashEncoded string
+	Size            int64
+	Downloaded      int64
+	Uploaded        int64
+	Left            int64
+	MaxDownload     int64
+	TrackerUrl      string
+	CachedPeers     []byte
+}
+
+var infoHashMap = make(map[string]InfoHash)
+
+func makeInfoHash(infoHash string, initSize int64, trackerUrl string) InfoHash {
+	maxDownload := rand.Int63n(5120*1024-512*1024) + 512*1024
+	infoHashEncoded := url.QueryEscape(infoHash)
+
+	return InfoHash{
+		InfoHash:        infoHash,
+		InfoHashEncoded: infoHashEncoded,
+		Size:            initSize,
+		Downloaded:      0,
+		Uploaded:        0,
+		Left:            initSize,
+		MaxDownload:     maxDownload,
+		TrackerUrl:      trackerUrl,
+	}
+}
+
+type TrackerEvent string
+
+const (
+	TrackerEventStarted   TrackerEvent = "started"
+	TrackerEventStopped   TrackerEvent = "stopped"
+	TrackerEventCompleted TrackerEvent = "completed"
+	TrackerEventEmpty     TrackerEvent = ""
+)
+
+func trackerReqUrl(infoHashObj InfoHash, event TrackerEvent) string {
+	return fmt.Sprintf("%s&info_hash=%s&peer_id=%s&port=%d&uploaded=0&downloaded=%d&left=%d&corrupt=0&key=%s"+
+		"&event=%s&numwant=200&compact=1&no_peer_id=1&supportcrypto=1&redundant=0",
+		infoHashObj.TrackerUrl, infoHashObj.InfoHashEncoded, peerId, port, infoHashObj.Downloaded, infoHashObj.Left, key, event)
+}
+
+func requestTrackerStop(infoHashObj InfoHash) {
+	reqURL := trackerReqUrl(infoHashObj, TrackerEventStopped)
+	fmt.Println("Requesting:", reqURL)
+}
+
+func requestTrackerInterval(trackerUrl string, infoHashObj InfoHash) {
+	// update downloaded and left
+	fakeRatio := rand.Float32()*0.2 - 0.1 + 1.0
+	fakeDownloaded := int64(float32(FAKE_SPEED) * fakeRatio)
+
+	infoHashObj.Downloaded += fakeDownloaded
+	infoHashObj.Left -= fakeDownloaded
+
+	reqURL := trackerReqUrl(infoHashObj, TrackerEventEmpty)
+	fmt.Println("Requesting:", reqURL)
+}
+
+func requestTrackerStart(trackerUrl string, infoHash string, initSize int64) {
+	if _, ok := infoHashMap[infoHash]; ok {
 		return
 	}
-	infoHashEncoded := url.QueryEscape(string(infoHash))
 
-	peerId := util.RandomPeerId()
-	key := util.RandomKey()
-
-	reqURL := fmt.Sprintf("%s&info_hash=%s&peer_id=%s&port=%d&uploaded=0&downloaded=0&left=%d&corrupt=0&key=%s"+
-		"&event=started&numwant=200&compact=1&no_peer_id=1&supportcrypto=1&redundant=0",
-		trackerUrl, infoHashEncoded, peerId, port, initSize, key)
+	infoHashObj := makeInfoHash(infoHash, initSize, trackerUrl)
+	reqURL := trackerReqUrl(infoHashObj, TrackerEventStarted)
 
 	fmt.Println("Requesting:", reqURL)
 
@@ -37,7 +96,7 @@ func requestTracker(trackerUrl string, infoHashHex string, initSize int64) {
 		panic(err)
 	}
 
-	req.Header.Set("User-Agent", "qBittorrent/4.6.3")
+	req.Header.Set("User-Agent", "qBittorrent/5.0.2")
 	req.Header.Set("Accept-Encoding", "gzip")
 	req.Header.Set("Connection", "close")
 
@@ -61,51 +120,31 @@ func requestTracker(trackerUrl string, infoHashHex string, initSize int64) {
 		panic(err)
 	}
 
-	filename := fmt.Sprintf("%s.peers", infoHashHex)
-	file, err := os.Create(filename)
-	if err != nil {
-		panic(err)
-	}
-
-	_, err = file.Write(body)
-	if err != nil {
-		panic(err)
-	}
-
-	err = file.Close()
-	if err != nil {
-		panic(err)
-	}
-
-	// fmt.Println(string(body))
-
-	// var v interface{}
-	// err = bencode.Unmarshal(body, &v)
-	// if err != nil {
-	// 	panic(err)
-	// }
-
-	// fmt.Printf("=====\n%+v\n", v)
+	infoHashObj.CachedPeers = body
+	infoHashMap[infoHash] = infoHashObj
 }
 
 func localFakeTrackerHandler(w http.ResponseWriter, r *http.Request) {
 	infoHash := r.URL.Query().Get("info_hash")
-	infoHash = hex.EncodeToString([]byte(infoHash))
 	fmt.Println("received request: ", infoHash)
 
-	filename := fmt.Sprintf("%s.peers", infoHash)
-	file, err := os.Open(filename)
-	if err != nil {
-		fmt.Println("file open error: ", err)
-		return
-	}
-	cachedPeers, err := io.ReadAll(file)
-	if err != nil {
-		fmt.Println("file read error: ", err)
-		return
-	}
+	if infoHashObj, ok := infoHashMap[infoHash]; ok {
+		w.Write(infoHashObj.CachedPeers)
+	} else {
+		event := r.URL.Query().Get("event")
+		origTracker := r.URL.Query().Get("orig_tracker")
+		totalSize, err := strconv.ParseInt(r.URL.Query().Get("total_size"), 10, 64)
+		if err != nil {
+			panic(err)
+		}
+		if event == string(TrackerEventStarted) {
+			fmt.Println("requesting tracker start: ", origTracker, infoHash, totalSize)
+			requestTrackerStart(origTracker, infoHash, totalSize)
+		}
 
-	w.Write(cachedPeers)
+		infoHashObj := infoHashMap[infoHash]
+		w.Write(infoHashObj.CachedPeers)
+	}
 }
 
 func main() {
@@ -118,7 +157,6 @@ func main() {
 	// Below is the main logic to process *.torrent files
 	// TODO: maybe generate a fixed port number on first run
 	// ideally use a port number that is identical to the one in your BT client
-	port = util.RandomPort()
 
 	// List *.torrent files
 	files, err := os.ReadDir(".")
@@ -133,18 +171,12 @@ func main() {
 			}
 
 			fmt.Println("processing: ", files[i].Name())
-			realAnnounce, hash, leftSize, err := util.ParseAndRegenerateTorrent(files[i].Name(), "http://127.0.0.1:1088/announce")
+			_, hash, leftSize, err := util.ParseAndRegenerateTorrent(files[i].Name(), "http://127.0.0.1:1088/announce")
 			if err != nil {
 				fmt.Println("Error: ", err)
 				continue
 			}
 			fmt.Printf("info_hash: %s, size: %d\n", hash, leftSize)
-
-			requestTracker(
-				realAnnounce,
-				hash,
-				leftSize,
-			)
 		}
 	}
 
